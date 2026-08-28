@@ -1,0 +1,38 @@
+{
+  "tube": {
+    "outer_diameter_mm": 75.0,
+    "wall_thickness_mm": 2.0,
+    "length_mm": 300.0,
+    "x_zero_at": "min",
+    "x_offset_mm": 0.0
+  },
+  "tool": {
+    "kind": "endmill",
+    "diameter_mm": 3.0,
+    "flutes": 2,
+    "spindle_rpm": 12000.0,
+    "spindle_cw": true,
+    "feed_cut_mm_min": 400.0,
+    "feed_plunge_mm_min": 80.0,
+    "feed_rapid_mm_min": 1500.0,
+    "feed_drill_mm_min": 40.0,
+    "max_rotary_speed_deg_min": 3000.0
+  },
+  "job": {
+    "safe_z_mm": 5.0,
+    "pass_depth_mm": 0.8,
+    "breakthrough_margin_mm": 0.4,
+    "tolerance_mm": 0.03,
+    "offset_reference": "outer",
+    "lead_in": true,
+    "spindle_warmup_s": 2.0,
+    "coolant": null,
+    "program_name": "PIPE_HOLES",
+    "drill_peck_mm": 1.0,
+    "drill_full_retract": true,
+    "drill_retract_mm": 0.5,
+    "drill_diameter_tolerance_mm": 0.15
+  },
+  "holes": [],
+  "source_model_path": null
+}
