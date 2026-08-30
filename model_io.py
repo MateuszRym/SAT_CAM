@@ -46,6 +46,10 @@ class RawHole:
     name: str
     points_xyz: np.ndarray   # (N,3) w ukladzie ORYGINALNYM modelu, petla zamknieta
     source: str = ""         # np. "step_face_wire_2"
+    # Przekazane z config.HoleDef.tabs_override dla otworow z trybu manualnego
+    # (None dla otworow wykrytych z STEP/mesh - tam decyduje wylacznie
+    # automatyczna heurystyka rozmiaru w toolpath.build_operations).
+    tabs_override: Optional[bool] = None
 
 
 @dataclass
@@ -186,13 +190,8 @@ def load_step_holes(path: str, tolerance_mm: float = 0.03,
 
     holes: List[RawHole] = []
     hole_idx = 0
-    x_min, x_max = math.inf, -math.inf
     for face, radius, _cyl in outer:
-        all_pts, loops_xyz = _mesh_face_boundary_loops(face, tolerance_mm, return_all_points=True)
-        if len(all_pts):
-            can_all = canonicalize(all_pts, axis)
-            x_min = min(x_min, float(can_all[:, 0].min()))
-            x_max = max(x_max, float(can_all[:, 0].max()))
+        loops_xyz = _mesh_face_boundary_loops(face, tolerance_mm)
         for pts in loops_xyz:
             can = canonicalize(pts, axis)
             x_range = float(np.ptp(can[:, 0]))
@@ -212,27 +211,20 @@ def load_step_holes(path: str, tolerance_mm: float = 0.03,
             "oraz TubeConfig.outer_diameter_mm (musi pasowac do promienia "
             "zewnetrznego w pliku STEP)."
         )
-    x_extent = (x_min, x_max) if math.isfinite(x_min) else None
-    return holes, axis, x_extent
+    return holes, axis
 
 
-def _mesh_face_boundary_loops(face, tolerance_mm: float, return_all_points: bool = False):
-    """Siatkuje POJEDYNCZA sciane i zwraca jej petle brzegowe jako punkty 3D (world).
-
-    Jesli return_all_points=True, zwraca krotke (wszystkie_punkty_siatki, petle) -
-    wszystkie_punkty_siatki uzywane sa do wyznaczenia calkowitego zasiegu rury
-    wzdluz osi (potrzebne do automatycznej referencji X maszyny)."""
+def _mesh_face_boundary_loops(face, tolerance_mm: float) -> List[np.ndarray]:
+    """Siatkuje POJEDYNCZA sciane i zwraca jej petle brzegowe jako punkty 3D (world)."""
     from OCP.BRepMesh import BRepMesh_IncrementalMesh
     from OCP.BRep import BRep_Tool
     from OCP.TopLoc import TopLoc_Location
-
-    empty = (np.empty((0, 3)), []) if return_all_points else []
 
     BRepMesh_IncrementalMesh(face, max(tolerance_mm, 0.001), False, 0.3, False)
     loc = TopLoc_Location()
     tri = BRep_Tool.Triangulation_s(face, loc)
     if tri is None or tri.NbNodes() == 0:
-        return empty
+        return []
     trsf = loc.Transformation()
 
     nodes = np.empty((tri.NbNodes(), 3), dtype=float)
@@ -254,10 +246,7 @@ def _mesh_face_boundary_loops(face, tolerance_mm: float, return_all_points: bool
     boundary_edges = [k for k, v in edge_count.items() if v == 1]
 
     loops_idx = _chain_edges_into_loops(boundary_edges)
-    loops = [merged_nodes[loop] for loop in loops_idx if len(loop) >= 4]
-    if return_all_points:
-        return merged_nodes, loops
-    return loops
+    return [merged_nodes[loop] for loop in loops_idx if len(loop) >= 4]
 
 
 def _merge_duplicate_points(points: np.ndarray, tol: float = 1e-4):
@@ -339,9 +328,7 @@ def load_mesh_holes(path: str, min_loop_points: int = 6) -> Tuple[List[RawHole],
         holes.append(RawHole(name=f"hole_{hole_idx}", points_xyz=pts,
                               source="mesh_boundary_loop"))
 
-    can_all = canonicalize(mesh.vertices, axis)
-    x_extent = (float(can_all[:, 0].min()), float(can_all[:, 0].max()))
-    return holes, axis, x_extent
+    return holes, axis
 
 
 def _chain_edges_into_loops(edges: List[Tuple[int, int]]) -> List[List[int]]:
@@ -395,7 +382,7 @@ def _polyline_length(pts: np.ndarray) -> float:
 
 def holes_from_manual_defs(hole_defs, tube_outer_radius_mm: float, tolerance_mm: float = 0.03):
     """Zwraca liste RawHole juz w ukladzie KANONICZNYM (x wzdluz osi X, promien=outer)."""
-    from . import hole_shapes as hs
+    import hole_shapes as hs
 
     holes = []
     for hd in hole_defs:
@@ -421,5 +408,6 @@ def holes_from_manual_defs(hole_defs, tube_outer_radius_mm: float, tolerance_mm:
             y = tube_outer_radius_mm * math.cos(theta)
             z = tube_outer_radius_mm * math.sin(theta)
             pts3d.append([x, y, z])
-        holes.append(RawHole(name=hd.name, points_xyz=np.array(pts3d), source="manual"))
+        holes.append(RawHole(name=hd.name, points_xyz=np.array(pts3d), source="manual",
+                              tabs_override=hd.tabs_override))
     return holes

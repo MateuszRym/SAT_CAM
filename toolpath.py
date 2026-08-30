@@ -42,6 +42,31 @@ DWA TRYBY OBROBKI OTWORU:
     bezpiecznego automatycznego trybu -- otwor jest pomijany z jasnym
     ostrzezeniem (uzyj mniejszego narzedzia albo wieksz tolerancje
     projektowa otworu).
+
+WIELE PRZEJSC DO PELNEJ GLEBOKOSCI:
+  Zaden pojedynczy przejazd (CONTOUR) ani pojedynczy peck (DRILL) nie
+  zaglebia sie od razu na cala grubosc sciany rury -- `_pass_depths()`
+  dzieli calkowita glebokosc (`JobConfig.total_cut_depth_mm`, czyli grubosc
+  sciany + naddatek na przebicie) na tyle rownych krokow, zeby zaden
+  pojedynczy dosuw nie przekroczyl `JobConfig.pass_depth_mm` (CONTOUR) /
+  `JobConfig.drill_peck_mm` (DRILL). Kazdy krok to osobne, pelne przejscie
+  ruchu (caly obrys konturu, albo jeden peck) na coraz wiekszej glebokosci
+  -- to jest wlasnie "kilka powtorzen ruchu do pelnej glebokosci". Liczbe
+  przejsc mozna podejrzec w UI PRZED wygenerowaniem sciezki przez
+  `JobConfig.estimated_pass_count()` / `estimated_peck_count()`, a po
+  wygenerowaniu operacji - w `HoleOperation.pass_count`.
+
+LĄCZNIKI / MOSTKI (tabs) w duzych otworach:
+  Wylacznie w trybie CONTOUR. Gdy otwor jest duzy wzgledem narzedzia
+  (patrz `JobConfig.tab_min_size_factor` / `HoleDef.tabs_override`),
+  program NIE dojezdza w kilku rownomiernie rozlozonych "oknach" na
+  obwodzie do pelnej glebokosci, tylko zatrzymuje sie na
+  `JobConfig.tab_cap_depth_mm()` -- zostawiajac tam cienki, nieprzewiercony
+  mostek materialu, ktory fizycznie podtrzymuje wyciety kawalek sciany az
+  do recznego wylamania po zdjeciu obrobionej rury z maszyny. Geometria
+  okien (ktore punkty sciezki wypadaja "w lączniku") liczona jest w
+  geometry_core (cumulative_arc_length / tab_windows / point_in_tab_mask)
+  na JUZ zoffsetowanym konturze (czyli na rzeczywistej sciezce narzedzia).
 """
 
 from __future__ import annotations
@@ -52,9 +77,9 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from . import geometry_core as gc
-from .config import TubeConfig, ToolConfig, JobConfig
-from .model_io import RawHole, TubeAxis, canonicalize
+import geometry_core as gc
+from config import TubeConfig, ToolConfig, JobConfig
+from model_io import RawHole, TubeAxis, canonicalize
 
 
 # --------------------------------------------------------------------------- #
@@ -63,9 +88,17 @@ from .model_io import RawHole, TubeAxis, canonicalize
 
 @dataclass
 class ContourPass:
-    z_mm: float             # docelowa glebokosc promieniowa tego przejscia (<=0, 0=powierzchnia)
+    z_mm: float             # NOMINALNA docelowa glebokosc promieniowa tego przejscia
+                             # (<=0, 0=powierzchnia) - gdy path_z_mm is None, CALY obrys
+                             # jedzie na tej stalej glebokosci; z_mm sluzy tez do raportow/
+                             # podgladu w UI nawet gdy path_z_mm jest ustawione.
     path_x_mm: np.ndarray    # (N,) pozycje X maszyny
     path_a_deg: np.ndarray   # (N,) pozycje A maszyny [stopnie, CIAGLE - bez zawijania]
+    path_z_mm: Optional[np.ndarray] = None  # (N,) glebokosc PER PUNKT - ustawiane tylko
+                             # gdy ten przejazd wchodzi w okna lacznikow (tabs): wiekszosc
+                             # punktow = z_mm, punkty w oknie lacznika = plytsza wartosc
+                             # (JobConfig.tab_cap_depth_mm) tak, by zostawic tam mostek
+                             # materialu. None -> caly obrys na stalym z_mm (typowy przypadek).
 
 
 @dataclass
@@ -87,6 +120,11 @@ class HoleOperation:
     ref_radius_mm: float = 0.0      # promien "rozwiniecia" tego otworu - potrzebny
                                      # gcode_writer do przeliczenia F na deg/min
                                      # dla blokow czysto obrotowych (patrz gcode_writer)
+    pass_count: int = 0              # liczba przejsc/peckow do pelnej glebokosci (dla UI -
+                                      # niezalezna od liczby petli/wysp na ktore rozpadl sie
+                                      # kontur po offsecie; patrz JobConfig.estimated_pass_count)
+    has_tabs: bool = False           # czy w tej operacji dodano lączniki (tabs)
+    tab_count: int = 0               # faktyczna liczba lacznikow na petle (0 gdy has_tabs=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -137,6 +175,31 @@ def _pass_depths(total_depth_mm: float, pass_depth_mm: float) -> List[float]:
 
 
 # --------------------------------------------------------------------------- #
+#  Lączniki / mostki (tabs) - decyzja "czy dodac" dla danego otworu
+# --------------------------------------------------------------------------- #
+
+def _hole_triggers_tabs(dense_xy: np.ndarray, tabs_override: Optional[bool],
+                         tool: ToolConfig, job: JobConfig) -> bool:
+    """
+    Decyduje, czy DANY otwor powinien dostac lączniki:
+      1. jesli otwor ma jawny `tabs_override` (z HoleDef, przekazany przez
+         RawHole) - wygrywa on ZAWSZE, niezaleznie od globalnego przelacznika
+         czy rozmiaru (UI: checkbox "wymus/wylacz lączniki dla tego otworu"),
+      2. w przeciwnym razie: `JobConfig.use_tabs` I dluzszy z bokow bbox
+         konturu (PRZED offsetem o promien narzedzia, czyli rzeczywisty
+         rozmiar otworu) >= `JobConfig.tab_threshold_mm(tool.diameter_mm)`.
+    `dense_xy` to kontur w plaszczyznie rozwinietej (x, s) - dokladnie to,
+    co build_operations juz i tak liczy przed wywolaniem offsetu.
+    """
+    if tabs_override is not None:
+        return bool(tabs_override)
+    if not job.use_tabs:
+        return False
+    w_mm, h_mm = gc.bbox_extent(dense_xy)
+    return max(w_mm, h_mm) >= job.tab_threshold_mm(tool.diameter_mm)
+
+
+# --------------------------------------------------------------------------- #
 #  Referencja X maszyny (ktory koniec modelu = X0) i kalibracja A
 # --------------------------------------------------------------------------- #
 
@@ -159,7 +222,8 @@ def canonical_x_to_machine(x_canonical_mm: np.ndarray, tube: TubeConfig,
 def _build_contour_operation(name: str, dense_xy: np.ndarray, ref_radius_mm: float,
                               tube: TubeConfig, tool: ToolConfig, job: JobConfig,
                               x_extent: Tuple[float, float], a_sign: int,
-                              a_zero_offset_deg: float) -> Optional[HoleOperation]:
+                              a_zero_offset_deg: float,
+                              tabs_enabled: bool = False) -> Optional[HoleOperation]:
     op = HoleOperation(name=name, mode="contour", ref_radius_mm=ref_radius_mm)
 
     loops = gc.offset_polygon_inward(dense_xy, tool.radius_mm, arc_tolerance_mm=job.tolerance_mm)
@@ -175,8 +239,9 @@ def _build_contour_operation(name: str, dense_xy: np.ndarray, ref_radius_mm: flo
     loops = [gc.resample_polyline(loop, max_seg_mm=max(tool.radius_mm / 4.0, 0.1))
              for loop in loops]
 
-    total_depth = tube.wall_thickness_mm + job.breakthrough_margin_mm
+    total_depth = job.total_cut_depth_mm(tube)
     depths = _pass_depths(total_depth, job.pass_depth_mm)
+    op.pass_count = len(depths)
 
     # ostrzezenie o naroznikach ktorych narzedzie nie wyrobi w pelni
     # (find_tight_corners oczekuje ZAMKNIETEJ petli, tj. xy[0]==xy[-1] -
@@ -186,13 +251,56 @@ def _build_contour_operation(name: str, dense_xy: np.ndarray, ref_radius_mm: flo
     for loop in loops:
         op.tight_corners.extend(gc.find_tight_corners(loop, tool.radius_mm))
 
+    # -------------------------------------------------------------------- #
+    #  Lączniki / mostki (tabs): licz OKNA RAZ na kazda petle (geometria nie
+    #  zmienia sie miedzy przejsciami na roznych glebokosciach), a nastepnie
+    #  przy kazdym przejsciu, ktore siegnie glebiej niz `tab_cap_depth_mm`,
+    #  przytnij glebokosc W OKNACH do tej wartosci (poza oknami - bez zmian).
+    #  Wczesniejsze, plytsze przejscia i tak nie docieraja do tab_cap_depth_mm,
+    #  wiec zostaja bez modyfikacji (path_z_mm=None => szybsza sciezka/gcode).
+    # -------------------------------------------------------------------- #
+    tabs_enabled = tabs_enabled and job.tab_count > 0 and job.tab_width_mm > 0 \
+        and job.tab_remaining_thickness_mm > 0
+    tab_cap_depth_mm = None
+    loop_tab_masks: List[Optional[np.ndarray]] = [None] * len(loops)
+    if tabs_enabled:
+        tab_cap_depth_mm = job.tab_cap_depth_mm(tube)
+        for li, loop in enumerate(loops):
+            cum_s = gc.cumulative_arc_length(loop)
+            perimeter = float(cum_s[-1])
+            windows = gc.tab_windows(perimeter, job.tab_count, job.tab_width_mm)
+            loop_tab_masks[li] = gc.point_in_tab_mask(cum_s, perimeter, windows)
+            tab_arc_fraction = (job.tab_count * job.tab_width_mm) / max(perimeter, 1e-6)
+            if tab_arc_fraction > 0.4:
+                op.warnings.append(
+                    f"Lączniki zajmuja ~{100*tab_arc_fraction:.0f}% obwodu otworu "
+                    f"(tab_count={job.tab_count} x tab_width_mm={job.tab_width_mm:.1f}mm) "
+                    f"- rozwaz mniej/wezsze lączniki, bo znaczna czesc konturu nie zostanie "
+                    f"przewiercona."
+                )
+        op.has_tabs = True
+        op.tab_count = job.tab_count
+        op.warnings.append(
+            f"Dodano {job.tab_count} lącznik(ow) (szer. {job.tab_width_mm:.1f}mm, "
+            f"pozostawiony material {job.tab_remaining_thickness_mm:.2f}mm) - otwor "
+            f"jest wiekszy niz {job.tab_min_size_factor:.1f}x fi narzedzia (albo wymuszono "
+            f"lączniki dla tego otworu recznie)."
+        )
+
     for z in depths:
-        for loop in loops:
+        clip_for_tabs = tabs_enabled and z > tab_cap_depth_mm
+        for li, loop in enumerate(loops):
             x_mm, theta_rad = gc.roll_back(loop, ref_radius_mm)
             x_machine = canonical_x_to_machine(x_mm, tube, x_extent)
             a_deg = gc.theta_to_deg_continuous(theta_rad, sign=a_sign,
                                                 zero_offset_deg=a_zero_offset_deg)
-            op.contour_passes.append(ContourPass(z_mm=-z, path_x_mm=x_machine, path_a_deg=a_deg))
+            if clip_for_tabs:
+                mask = loop_tab_masks[li]
+                z_per_point = np.where(mask, -tab_cap_depth_mm, -z)
+                op.contour_passes.append(ContourPass(z_mm=-z, path_x_mm=x_machine,
+                                                       path_a_deg=a_deg, path_z_mm=z_per_point))
+            else:
+                op.contour_passes.append(ContourPass(z_mm=-z, path_x_mm=x_machine, path_a_deg=a_deg))
 
     return op
 
@@ -208,8 +316,9 @@ def _build_drill_operation(name: str, center_xy_unrolled: np.ndarray, ref_radius
     a_deg = float(gc.theta_to_deg_continuous(theta_rad, sign=a_sign,
                                               zero_offset_deg=a_zero_offset_deg)[0])
 
-    total_depth = tube.wall_thickness_mm + job.breakthrough_margin_mm
+    total_depth = job.total_cut_depth_mm(tube)
     pecks = _pass_depths(total_depth, job.drill_peck_mm)
+    op.pass_count = len(pecks)
     op.drill = DrillCycle(x_mm=x_machine, a_deg=a_deg,
                            peck_targets_mm=[-p for p in pecks],
                            full_retract=job.drill_full_retract)
@@ -255,8 +364,11 @@ def build_operations(raw_holes: List[RawHole], axis: TubeAxis,
         # wiec test okragosci na surowych punktach jest zawodny.
         dense = gc.resample_polyline(unrolled, max_seg_mm=max(tool.radius_mm / 3.0, 0.15))
 
+        tabs_enabled = _hole_triggers_tabs(dense, rh.tabs_override, tool, job)
+
         op = _build_contour_operation(rh.name, dense, ref_radius, tube, tool, job,
-                                       x_extent, a_sign, a_zero_offset_deg)
+                                       x_extent, a_sign, a_zero_offset_deg,
+                                       tabs_enabled=tabs_enabled)
 
         if op is None:
             # kontur sie nie miesci -- sprawdz czy to (w przyblizeniu) kolo,

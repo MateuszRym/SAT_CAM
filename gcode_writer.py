@@ -42,8 +42,8 @@ import math
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
-from .config import TubeConfig, ToolConfig, JobConfig
-from .toolpath import HoleOperation
+from config import TubeConfig, ToolConfig, JobConfig
+from toolpath import HoleOperation
 
 
 # --------------------------------------------------------------------------- #
@@ -229,23 +229,37 @@ def _write_footer(w: _Writer, tube: TubeConfig, job: JobConfig):
 
 
 def _write_contour(w: _Writer, op: HoleOperation, tool: ToolConfig, job: JobConfig):
+    """
+    Zapisuje wszystkie przejscia konturu. Gdy `p.path_z_mm` jest ustawione
+    (przejscie wchodzi w okno lącznika/tabs - patrz toolpath._build_contour_operation),
+    Z jedzie RAZEM z X/A w kazdym punkcie obrysu (zamiast byc stale po nakluciu),
+    zeby plytko "przeskoczyc" nad mostkiem materialu i wrocic na pelna glebokosc
+    po drugiej stronie okna. audit_feed() juz liczy dystans liniowy jako
+    hypot(dX, dZ), wiec taki mieszany ruch jest bezpiecznie zsynchronizowany
+    tak samo jak zwykle naklucie.
+    """
     max_rot = tool.max_rotary_speed_deg_min
     ref_r = op.ref_radius_mm
 
-    first_pass = True
     for p in op.contour_passes:
         x0, a0 = float(p.path_x_mm[0]), float(p.path_a_deg[0])
+        z0 = float(p.path_z_mm[0]) if p.path_z_mm is not None else p.z_mm
         # dojazd (na safe_z) do punktu startowego tej petli
         w.move(x=x0, a=a0, feed_mm_min=tool.feed_rapid_mm_min,
                max_rotary_deg_min=max_rot, ref_radius_mm=ref_r, is_rapid_reposition=True)
         # naklucie promieniowe (Z) w miejscu startowym - ruch czysto liniowy
-        w.move(z=p.z_mm, feed_mm_min=tool.feed_plunge_mm_min,
+        # (do z0, ktore uwzglednia juz ewentualne okno lącznika w punkcie startowym)
+        w.move(z=z0, feed_mm_min=tool.feed_plunge_mm_min,
                max_rotary_deg_min=max_rot, ref_radius_mm=ref_r)
         # obrys konturu
-        for x, a in zip(p.path_x_mm[1:], p.path_a_deg[1:]):
-            w.move(x=float(x), a=float(a), feed_mm_min=tool.feed_cut_mm_min,
-                   max_rotary_deg_min=max_rot, ref_radius_mm=ref_r)
-        first_pass = False
+        if p.path_z_mm is not None:
+            for x, a, z in zip(p.path_x_mm[1:], p.path_a_deg[1:], p.path_z_mm[1:]):
+                w.move(x=float(x), z=float(z), a=float(a), feed_mm_min=tool.feed_cut_mm_min,
+                       max_rotary_deg_min=max_rot, ref_radius_mm=ref_r)
+        else:
+            for x, a in zip(p.path_x_mm[1:], p.path_a_deg[1:]):
+                w.move(x=float(x), a=float(a), feed_mm_min=tool.feed_cut_mm_min,
+                       max_rotary_deg_min=max_rot, ref_radius_mm=ref_r)
 
     # odsuniecie po ostatnim przejsciu
     w.move(z=job.safe_z_mm, feed_mm_min=tool.feed_rapid_mm_min,

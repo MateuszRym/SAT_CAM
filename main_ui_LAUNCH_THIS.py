@@ -10,9 +10,11 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from config import Project, ToolKind
 from model_io import load_step_holes, load_mesh_holes, canonicalize
 from geometry_core import (
-    axis_project, unwrap_theta, unroll, 
-    offset_polygon_inward, roll_back, theta_to_deg_continuous
+    axis_project, unwrap_theta, unroll, roll_back, theta_to_deg_continuous
 )
+
+from toolpath import build_operations
+from gcode_writer import generate_gcode as generate_gcode_text
 
 class CAMHoleApp:
     def __init__(self, root):
@@ -79,7 +81,12 @@ class CAMHoleApp:
         
         tk.Label(left_frame, text="Eksport i Symulacja", font=("Arial", 10, "bold")).pack(pady=(15, 5))
         tk.Button(left_frame, text="Generuj G-Code", command=self.generate_gcode, width=28, bg="lightblue").pack(pady=5)
-        tk.Button(left_frame, text="▶ Symuluj obróbkę", command=self.start_simulation, width=28, bg="lightgreen").pack(pady=5)
+        
+        # --- NOWY UKŁAD: Start i Stop Symulacji ---
+        sim_frame = tk.Frame(left_frame)
+        sim_frame.pack(pady=5)
+        tk.Button(sim_frame, text="▶ Symuluj", command=self.start_simulation, width=12, bg="lightgreen").pack(side=tk.LEFT, padx=2)
+        tk.Button(sim_frame, text="⏹ Stop", command=self.stop_simulation, width=12, bg="lightcoral").pack(side=tk.RIGHT, padx=2)
 
         # Sekcja paska postępu
         self.progress_var = tk.DoubleVar()
@@ -130,8 +137,31 @@ class CAMHoleApp:
         self.var_tube_od.set(str(self.project.tube.outer_diameter_mm))
         self.var_wall.set(str(self.project.tube.wall_thickness_mm))
 
+    def _update_tube_params_from_model(self):
+        """Aktualizuje pola UI na podstawie danych z wczytanego modelu 3D."""
+        if self.axis:
+            # W model_io.py 'radius_mm' to promień zewnętrzny
+            detected_od = self.axis.radius_mm * 2.0
+            
+            try:
+                current_od = float(self.var_tube_od.get())
+            except ValueError:
+                current_od = 0.0
+                
+            # Podmień, tylko jeśli nowa średnica różni się od wpisanej w okienku o więcej niż 0.05 mm
+            if abs(current_od - detected_od) > 0.05:
+                self.var_tube_od.set(f"{detected_od:.2f}")
+                self.project.tube.outer_diameter_mm = detected_od
+                
+                messagebox.showinfo(
+                    "Wykryto parametry rury", 
+                    f"Odczytano średnicę rury z modelu i zaktualizowano UI: {detected_od:.2f} mm.\n\n"
+                    f"Uwaga: Grubość ścianki pozostawiono bez zmian ({self.var_wall.get()} mm). "
+                    f"Upewnij się, że jest ona poprawna dla tego modelu."
+                )
+
     def stop_simulation(self):
-        """Zatrzymuje ewentualnie trwającą animację przy odświeżaniu widoku"""
+        """Zatrzymuje ewentualnie trwającą animację przy odświeżaniu widoku lub ręcznie z przycisku"""
         if self.sim_job:
             self.root.after_cancel(self.sim_job)
             self.sim_job = None
@@ -141,7 +171,7 @@ class CAMHoleApp:
             except:
                 pass
             self.tool_marker = None
-        self.lbl_status.config(text="Gotowy")
+        self.lbl_status.config(text="Gotowy / Symulacja zatrzymana")
         self.progress_var.set(0)
 
     def load_project(self):
@@ -169,8 +199,8 @@ class CAMHoleApp:
         path = filedialog.askopenfilename(filetypes=[("STEP Files", "*.step *.stp")])
         if path:
             try:
-                # ZMIANA: Dodano *_ na końcu, aby zignorować dodatkowe zwracane parametry (np. wymiary rury)
                 self.holes, self.axis, *_ = load_step_holes(path, tolerance_mm=self.project.job.tolerance_mm)
+                self._update_tube_params_from_model()
                 self.update_preview()
             except Exception as e:
                 messagebox.showerror("Błąd STEP", str(e))
@@ -179,8 +209,8 @@ class CAMHoleApp:
         path = filedialog.askopenfilename(filetypes=[("Mesh Files", "*.3mf *.stl *.obj")])
         if path:
             try:
-                # ZMIANA: Analogiczne dodanie *_ dla importu siatek
                 self.holes, self.axis, *_ = load_mesh_holes(path)
+                self._update_tube_params_from_model()
                 self.update_preview()
             except Exception as e:
                 messagebox.showerror("Błąd Siatki", str(e))
@@ -201,6 +231,10 @@ class CAMHoleApp:
         for hole in self.holes:
             can_pts = canonicalize(hole.points_xyz, self.axis)
             all_x.extend(can_pts[:, 0])
+        
+        if not all_x:
+            return
+            
         x_min, x_max = min(all_x) - 10, max(all_x) + 10
         
         x_grid = np.linspace(x_min, x_max, 50)
@@ -219,64 +253,53 @@ class CAMHoleApp:
     def update_preview(self):
         self.stop_simulation()
         self.reset_plot_view()
-        self.sim_points = [] # Zerowanie punktów dla nowej ścieżki narzędzia
+        self.sim_points = [] 
 
         if not self.holes or not self.axis:
             self.canvas.draw()
             return
 
-        tool_radius = self.project.tool.radius_mm
         ref_radius = self.project.tube.outer_radius_mm
-        is_drill = self.project.tool.kind == ToolKind.DRILL
-
         self.draw_transparent_cylinder(ref_radius)
 
+        # Rysowanie oryginalnych konturów (na czarno, z cieniem)
         for hole in self.holes:
             can_pts = canonicalize(hole.points_xyz, self.axis)
             axis_pts = axis_project(can_pts)
             thetas = unwrap_theta(axis_pts)
             xs = np.array([p.x_mm for p in axis_pts])
-            
             xy_unrolled = unroll(xs, thetas, ref_radius)
             orig_theta = xy_unrolled[:, 1] / ref_radius
             orig_y = ref_radius * np.cos(orig_theta)
             orig_z = ref_radius * np.sin(orig_theta)
             self.ax.plot(xy_unrolled[:, 0], orig_y, orig_z, 'k-', alpha=0.5)
 
-            # --- NOWA INTELIGENTNA LOGIKA DETEKCJI ---
-            tool_dia = self.project.tool.diameter_mm
-            tolerance = getattr(self.project.job, 'drill_diameter_tolerance_mm', 0.05)
-            
-            hole_w = np.max(xy_unrolled[:, 0]) - np.min(xy_unrolled[:, 0])
-            hole_h = np.max(xy_unrolled[:, 1]) - np.min(xy_unrolled[:, 1])
-            
-            # Wymusza punktowanie jeśli narzędzie pokrywa wymiar otworu
-            force_drill = is_drill or (hole_w <= tool_dia + tolerance and hole_h <= tool_dia + tolerance)
+        # Generowanie ścieżek z toolpath.py
+        ops = build_operations(
+            self.holes, self.axis, 
+            self.project.tube, self.project.tool, self.project.job
+        )
 
-            if force_drill:
-                center_x = (np.max(xy_unrolled[:, 0]) + np.min(xy_unrolled[:, 0])) / 2.0
-                center_s = (np.max(xy_unrolled[:, 1]) + np.min(xy_unrolled[:, 1])) / 2.0
-                c_theta = center_s / ref_radius
-                cy = ref_radius * np.cos(c_theta)
-                cz = ref_radius * np.sin(c_theta)
-                
-                self.ax.plot([center_x], [cy], [cz], 'rx', markersize=8, markeredgewidth=2)
-                
-                # Dodanie punktu dla symulacji wiercenia
-                self.sim_points.append((center_x, cy, cz))
-            else:
-                toolpaths = offset_polygon_inward(xy_unrolled, tool_radius)
-                for tp in toolpaths:
-                    tp_draw = np.vstack([tp, tp[0]])
-                    tp_x = tp_draw[:, 0]
-                    tp_theta = tp_draw[:, 1] / ref_radius
-                    tp_y = ref_radius * np.cos(tp_theta)
-                    tp_z = ref_radius * np.sin(tp_theta)
+        # Rysowanie faktycznych wygenerowanych ścieżek
+        for op in ops:
+            if op.mode == "contour":
+                for pass_op in op.contour_passes:
+                    a_rad = np.radians(pass_op.path_a_deg)
+                    tp_y = ref_radius * np.cos(a_rad)
+                    tp_z = ref_radius * np.sin(a_rad)
+                    tp_x = pass_op.path_x_mm
                     
-                    self.ax.plot(tp_x, tp_y, tp_z, 'r--', linewidth=2)
-                    
-                    # Zebranie punktów do animacji frezowania
+                    self.ax.plot(tp_x, tp_y, tp_z, 'r--', linewidth=1.5)
                     self.sim_points.extend(list(zip(tp_x, tp_y, tp_z)))
+                    
+            elif op.mode == "drill":
+                a_rad = np.radians(op.drill.a_deg)
+                cy = ref_radius * np.cos(a_rad)
+                cz = ref_radius * np.sin(a_rad)
+                cx = op.drill.x_mm
+                
+                self.ax.plot([cx], [cy], [cz], 'rx', markersize=8, markeredgewidth=2)
+                self.sim_points.append((cx, cy, cz))
 
         self.canvas.draw()
 
@@ -287,7 +310,6 @@ class CAMHoleApp:
             
         self.stop_simulation()
         
-        # Przygotowanie wskaźnika (magenta kropka symbolizująca frez/wiertło)
         self.tool_marker, = self.ax.plot([], [], [], 'mo', markersize=8, label='Narzędzie')
         self.ax.legend()
         
@@ -295,7 +317,6 @@ class CAMHoleApp:
         self.sim_idx = 0
         self.lbl_status.config(text="Symulacja w toku...")
         
-        # Wywołanie pętli animacji
         self._animate_step()
 
     def _animate_step(self):
@@ -307,16 +328,13 @@ class CAMHoleApp:
 
         x, y, z = self.sim_points[self.sim_idx]
         
-        # Aktualizacja pozycji w 3D
         self.tool_marker.set_data([x], [y])
         self.tool_marker.set_3d_properties([z])
         self.canvas.draw_idle()
 
-        # Aktualizacja paska postępu
         self.sim_idx += 1
         self.progress_var.set(self.sim_idx)
         
-        # Kolejny krok za 40 ms
         self.sim_job = self.root.after(40, self._animate_step)
 
     def generate_gcode(self):
@@ -328,87 +346,32 @@ class CAMHoleApp:
         if not out_path:
             return
 
-        tool_radius = self.project.tool.radius_mm
-        ref_radius = self.project.tube.outer_radius_mm
-        safe_z = self.project.job.safe_z_mm
-        cut_z = -self.project.tube.wall_thickness_mm - self.project.job.breakthrough_margin_mm
-        feed = self.project.tool.feed_cut_mm_min
-        is_drill = self.project.tool.kind == ToolKind.DRILL
-
-        gcode_lines = [
-            f"(Program: {self.project.job.program_name})",
-            "(Maszyna XZA - Generacja Automatyczna)",
-            f"(Tryb pracy: {'WIERCENIE' if is_drill else 'FREZOWANIE KONTUROW'})",
-            "G21 (Jednostki: mm)",
-            "G90 (Programowanie absolutne)",
-            f"G0 Z{safe_z:.3f} (Podniesienie na bezpieczna wysokosc)",
-        ]
-
-        m_code = "M3" if self.project.tool.spindle_cw else "M4"
-        gcode_lines.append(f"{m_code} S{int(self.project.tool.spindle_rpm)} (Start wrzeciona)")
-        if self.project.job.coolant == "mist": gcode_lines.append("M7 (Chlodzenie mgla)")
-        elif self.project.job.coolant == "flood": gcode_lines.append("M8 (Chlodzenie plynem)")
-
         try:
-            for hole in self.holes:
-                can_pts = canonicalize(hole.points_xyz, self.axis)
-                axis_pts = axis_project(can_pts)
-                thetas = unwrap_theta(axis_pts)
-                xs = np.array([p.x_mm for p in axis_pts])
-                xy_unrolled = unroll(xs, thetas, ref_radius)
-                
-                gcode_lines.append(f"\n(--- Start obrobki otworu ---)")
-                
-                # --- NOWA INTELIGENTNA LOGIKA DETEKCJI ---
-                tool_dia = self.project.tool.diameter_mm
-                tolerance = getattr(self.project.job, 'drill_diameter_tolerance_mm', 0.05)
-                
-                hole_w = np.max(xy_unrolled[:, 0]) - np.min(xy_unrolled[:, 0])
-                hole_h = np.max(xy_unrolled[:, 1]) - np.min(xy_unrolled[:, 1])
-                
-                force_drill = is_drill or (hole_w <= tool_dia + tolerance and hole_h <= tool_dia + tolerance)
-                
-                if force_drill:
-                    center_x = (np.max(xy_unrolled[:, 0]) + np.min(xy_unrolled[:, 0])) / 2.0
-                    center_s = (np.max(xy_unrolled[:, 1]) + np.min(xy_unrolled[:, 1])) / 2.0
-                    
-                    _, center_theta = roll_back(np.array([[center_x, center_s]]), ref_radius)
-                    center_a_deg = theta_to_deg_continuous(center_theta)[0]
-                    
-                    gcode_lines.append(f"G0 X{center_x:.3f} A{center_a_deg:.3f} (Nawigacja nad srodek)")
-                    gcode_lines.append(f"G1 Z{cut_z:.3f} F{self.project.tool.feed_plunge_mm_min:.1f} (Wiercenie)")
-                    gcode_lines.append(f"G0 Z{safe_z:.3f} (Wycofanie)")
-
-                else:
-                    toolpaths = offset_polygon_inward(xy_unrolled, tool_radius)
-                    for tp in toolpaths:
-                        x_path, theta_path = roll_back(tp, ref_radius)
-                        a_deg_path = theta_to_deg_continuous(theta_path)
-                        
-                        gcode_lines.append(f"G0 X{x_path[0]:.3f} A{a_deg_path[0]:.3f}")
-                        gcode_lines.append(f"G1 Z{cut_z:.3f} F{self.project.tool.feed_plunge_mm_min:.1f}")
-                        
-                        for x_val, a_val in zip(x_path[1:], a_deg_path[1:]):
-                            gcode_lines.append(f"G1 X{x_val:.3f} A{a_val:.3f} F{feed:.1f}")
-                        
-                        gcode_lines.append(f"G1 X{x_path[0]:.3f} A{a_deg_path[0]:.3f} F{feed:.1f}")
-                        gcode_lines.append(f"G0 Z{safe_z:.3f}")
-
-            gcode_lines.append("\nM5 (Wylaczenie wrzeciona)")
-            gcode_lines.append("M9 (Wylaczenie chlodzenia)")
-            gcode_lines.append(f"G0 Z{safe_z + 10:.3f}")
-            gcode_lines.append("M30 (Koniec programu)")
+            ops = build_operations(
+                self.holes, self.axis, 
+                self.project.tube, self.project.tool, self.project.job
+            )
+            
+            gcode_text, warnings = generate_gcode_text(
+                ops, self.project.tube, self.project.tool, self.project.job
+            )
 
             with open(out_path, 'w', encoding='utf-8') as f:
-                f.write("\n".join(gcode_lines))
+                f.write(gcode_text)
             
-            messagebox.showinfo("Sukces", f"Zapisano G-Code do:\n{out_path}")
+            msg = f"Zapisano G-Code do:\n{out_path}"
+            if warnings:
+                msg += "\n\nWYGENEROWANO OSTRZEŻENIA:\n- " + "\n- ".join(warnings)
+                messagebox.showwarning("Sukces z ostrzeżeniami", msg)
+            else:
+                messagebox.showinfo("Sukces", msg)
 
         except Exception as e:
             messagebox.showerror("Błąd generacji", f"Wystąpił błąd podczas generowania ścieżki:\n{str(e)}")
 
+
 if __name__ == "__main__":
     root = tk.Tk()
-    root.geometry("1100x630") # Lekko podniesiona ramka, by pomieścić pasek postępu
+    root.geometry("1100x630") 
     app = CAMHoleApp(root)
     root.mainloop()
