@@ -43,22 +43,13 @@ Krok po kroku:
 
 5) Funkcje pomocnicze: unwrap kata (ciaglosc bez skokow 0/360),
    walidacja (czy narzedzie miesci sie w otworze / promieniu naroznika).
-
-6) Lączniki / mostki (tabs), patrz README p. "Łączniki w dużych otworach":
-   przy duzych otworach wyciety fragment sciany rury moze odpasc do srodka
-   rury zanim frez skonczy obrys - `cumulative_arc_length`, `tab_windows`
-   i `point_in_tab_mask` licza, KTORE punkty rozwinietego konturu wypadaja
-   w oknach lacznikow (rownomiernie rozlozonych po obwodzie otworu). Sama
-   decyzja "czy dodac lączniki" i docelowa glebokosc w oknie lącznika
-   (zeby zostawic kawalek nieprzewierconej sciany) siedzi w toolpath.py
-   (tam, gdzie znane sa juz przejscia/glebokosci) - tutaj tylko geometria.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
@@ -136,7 +127,7 @@ def theta_to_deg_continuous(theta_unwrapped_rad: np.ndarray, sign: int = 1,
 # --------------------------------------------------------------------------- #
 
 def offset_polygon_inward(xy: np.ndarray, offset_mm: float,
-                           arc_tolerance_mm: Optional[float] = None) -> List[np.ndarray]:
+                           arc_tolerance_mm: float = None) -> List[np.ndarray]:
     """
     Przesuwa zamkniety kontur (N,2) o `offset_mm` DO WEWNATRZ (w strone
     usuwanego materialu = wnetrza otworu). Zwraca liste petli (moze byc >1,
@@ -146,23 +137,20 @@ def offset_polygon_inward(xy: np.ndarray, offset_mm: float,
     Kontur WEJSCIOWY musi byc CCW (patrz hole_shapes.ensure_ccw) - przy
     CCW dodatni ClipperOffset z ujemnym argumentem daje offset do wnetrza.
 
-    `arc_tolerance_mm`: tolerancja cieciwy dla tesselacji JT_ROUND naroznikow
-    wypuklych po offsecie (pyclipper.PyclipperOffset.ArcTolerance, w mm --
-    funkcja sama przelicza na skalowane jednostki Clippera). Domyslna wartosc
-    biblioteki (0.25 w jednostkach WEWNETRZNYCH, czyli ~0.000025mm przy naszym
-    CLIPPER_SCALE) jest absurdalnie drobna i generuje niepotrzebnie ogromna
-    liczbe punktow na kazdym zaokraglonym naroznikuu -- przekazanie tu tej
-    samej tolerancji cieciwy co reszta programu (typowo JobConfig.tolerance_mm)
-    daje spojna gestosc punktow bez utraty dokladnosci potrzebnej do obrobki.
-    Gdy None, uzywana jest wartosc domyslna pyclipper.
+    `arc_tolerance_mm`: [PATCH - zgodnosc z wywolaniem w toolpath.py, ktore
+    przekazuje job.tolerance_mm] maksymalny blad cieciwy dla lukow JT_ROUND
+    generowanych na wypuklych naroznikach offsetu. Przekazywane wprost do
+    pyclipper.PyclipperOffset.ArcTolerance (te same jednostki co CLIPPER_SCALE,
+    wiec skalujemy tak samo jak wspolrzedne). Jesli None, uzywany jest
+    domyslny ArcTolerance z pyclipper.
     """
     assert offset_mm >= 0
     path = (xy[:-1] if np.allclose(xy[0], xy[-1]) else xy)  # bez powielonego punktu koncowego
     scaled = pyclipper.scale_to_clipper(path.tolist(), CLIPPER_SCALE)
 
     pco = pyclipper.PyclipperOffset()
-    if arc_tolerance_mm is not None and arc_tolerance_mm > 0:
-        pco.ArcTolerance = arc_tolerance_mm * CLIPPER_SCALE
+    if arc_tolerance_mm is not None:
+        pco.ArcTolerance = max(arc_tolerance_mm, 1e-4) * CLIPPER_SCALE
     # JT_ROUND: frez jest okragly, wiec zaokraglone naroza to fizycznie
     # poprawny ksztalt sladu narzedzia w naroznikach wypuklych "od zewnatrz"
     pco.AddPath(scaled, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
@@ -177,16 +165,6 @@ def offset_polygon_inward(xy: np.ndarray, offset_mm: float,
     return loops
 
 
-def bbox_extent(xy: np.ndarray) -> Tuple[float, float]:
-    """
-    Zwraca (szerokosc, wysokosc) prostokata opisanego na konturze (w
-    plaszczyznie rozwinietej x/s). Uzywane m.in. przez max_inscribed_gap
-    oraz przez toolpath.py do decyzji o automatycznym dodaniu lacznikow
-    (tabs) w duzych otworach -- patrz JobConfig.tab_min_size_factor.
-    """
-    return float(np.ptp(xy[:, 0])), float(np.ptp(xy[:, 1]))
-
-
 def max_inscribed_gap(xy: np.ndarray) -> float:
     """
     Przyblizona najmniejsza 'szerokosc' otworu -- offset wiekszy od polowy
@@ -194,8 +172,9 @@ def max_inscribed_gap(xy: np.ndarray) -> float:
     Uzywane tylko do wczesnego ostrzezenia w UI, NIE jako twarda walidacja
     (dokladna odpowiedz daje offset_polygon_inward zwracajac pusta liste).
     """
-    w, h = bbox_extent(xy)
-    return float(min(w, h))
+    xs = xy[:, 0]
+    ys = xy[:, 1]
+    return float(min(xs.max() - xs.min(), ys.max() - ys.min()))
 
 
 # --------------------------------------------------------------------------- #
@@ -248,64 +227,3 @@ def _circumradius(a, b, c):
     if area < 1e-9:
         return None
     return (ab * bc * ca) / (4.0 * area)
-
-
-# --------------------------------------------------------------------------- #
-#  Lączniki / mostki (tabs) -- geometria rozmieszczenia okien na konturze.
-#  Decyzje "czy dodac" i "jak glebokie okno" naleza do toolpath.py; tutaj
-#  tylko czysta geometria dlugosci luku, dzialajaca na PLASKIM (juz
-#  rozwinietym x/s) konturze -- dlatego zwykla euklidesowa dlugosc odcinka
-#  jest tu poprawnym przyblizeniem dlugosci luku (patrz zalozenia w naglowku
-#  pliku: grubosc sciany << promien rury).
-# --------------------------------------------------------------------------- #
-
-def cumulative_arc_length(xy: np.ndarray) -> np.ndarray:
-    """
-    Skumulowana dlugosc luku wzdluz polilinii, zaczynajac od 0 w pierwszym
-    punkcie. Zwraca tablice (N,) tej samej dlugosci co `xy`. Dla petli
-    zamknietej (xy[0] == xy[-1]) ostatni element to pelny obwod konturu.
-    """
-    seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
-    return np.concatenate([[0.0], np.cumsum(seg)])
-
-
-def tab_windows(perimeter_mm: float, tab_count: int, tab_width_mm: float,
-                 phase_offset_mm: float = 0.0) -> List[Tuple[float, float]]:
-    """
-    Zwraca liste (start, koniec) okien lacznikow rownomiernie rozlozonych
-    na obwodzie `perimeter_mm` (te same jednostki dlugosci luku 's' co
-    `cumulative_arc_length`). Okna moga wykraczac poza [0, perimeter_mm]
-    (np. ujemny start) -- `point_in_tab_mask` obsluguje zawijanie modulo
-    obwod, wiec nie trzeba tu nic przycinac.
-    """
-    if tab_count <= 0 or tab_width_mm <= 0 or perimeter_mm <= 0:
-        return []
-    half = tab_width_mm / 2.0
-    windows = []
-    for i in range(tab_count):
-        center = phase_offset_mm + perimeter_mm * i / tab_count
-        windows.append((center - half, center + half))
-    return windows
-
-
-def point_in_tab_mask(cum_s: np.ndarray, perimeter_mm: float,
-                       windows: Sequence[Tuple[float, float]]) -> np.ndarray:
-    """
-    Maska bool (N,): czy dany punkt (wg dlugosci luku `cum_s`) wypada w
-    ktoryms z okien lacznikow, z poprawnym zawijaniem przez zszycie 0/obwod
-    (istotne, bo pierwszy punkt konturu prawie nigdy nie wypada dokladnie
-    na srodku miedzy dwoma lacznikami).
-    """
-    n = len(cum_s)
-    if not windows or perimeter_mm <= 0:
-        return np.zeros(n, dtype=bool)
-    mask = np.zeros(n, dtype=bool)
-    for start, end in windows:
-        s0 = start % perimeter_mm
-        s1 = end % perimeter_mm
-        if s0 <= s1:
-            mask |= (cum_s >= s0) & (cum_s <= s1)
-        else:
-            # okno przechodzi przez szew 0/perimeter (np. lacznik "na starcie" konturu)
-            mask |= (cum_s >= s0) | (cum_s <= s1)
-    return mask

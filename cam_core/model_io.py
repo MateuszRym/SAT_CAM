@@ -27,9 +27,12 @@ Dwie sciezki:
         wyeksportowac model jako STEP.
 
 Obie sciezki zwracaja liste `RawHole` (punkty 3D w ukladzie modelu +
-metadane), oraz funkcje do automatycznego wykrycia osi rury (dopasowanie
-walca metoda najmniejszych kwadratow), potrzebnej do kanonizacji ukladu
-wspolrzedny przed przekazaniem do geometry_core.
+metadane), TubeAxis (dopasowana os rury), oraz [PATCH/FEATURE]
+TubeGeometryInfo -- promien zewnetrzny/wewnetrzny i dlugosc rury
+ODCZYTANE WPROST Z GEOMETRII MODELU, zeby UI moglo automatycznie
+wypelnic TubeConfig zamiast wymagac od uzytkownika recznego przepisania
+tych wartosci PRZED wczytaniem pliku (patrz cam_ui/engine_bridge.py i
+cam_ui/main_window.py::_apply_detected_tube_geometry).
 """
 
 from __future__ import annotations
@@ -46,10 +49,6 @@ class RawHole:
     name: str
     points_xyz: np.ndarray   # (N,3) w ukladzie ORYGINALNYM modelu, petla zamknieta
     source: str = ""         # np. "step_face_wire_2"
-    # Przekazane z config.HoleDef.tabs_override dla otworow z trybu manualnego
-    # (None dla otworow wykrytych z STEP/mesh - tam decyduje wylacznie
-    # automatyczna heurystyka rozmiaru w toolpath.build_operations).
-    tabs_override: Optional[bool] = None
 
 
 @dataclass
@@ -57,6 +56,25 @@ class TubeAxis:
     point_on_axis: np.ndarray   # (3,)
     direction: np.ndarray       # (3,) znormalizowany
     radius_mm: float
+
+
+@dataclass
+class TubeGeometryInfo:
+    """
+    [PATCH/FEATURE] Geometria rury odczytana wprost z pliku modelu (STEP/mesh),
+    zwracana obok listy otworow, zeby UI moglo automatycznie wypelnic
+    TubeConfig zamiast wymagac recznego przepisania srednicy/dlugosci przez
+    uzytkownika PRZED wczytaniem pliku (patrz load_step_holes/load_mesh_holes).
+
+    Pola oznaczone Optional moga byc None, gdy danej wielkosci nie da sie
+    wiarygodnie wyznaczyc z geometrii (np. brak osobno zamodelowanej
+    powierzchni wewnetrznej -> nie znamy grubosci sciany) - w takim wypadku
+    UI powinno zachowac dotychczasowa, reczna wartosc uzytkownika.
+    """
+    outer_radius_mm: float
+    inner_radius_mm: Optional[float] = None
+    length_mm: Optional[float] = None
+    x_extent: Optional[Tuple[float, float]] = None   # (min, max) w ukladzie KANONICZNYM (po canonicalize())
 
 
 # --------------------------------------------------------------------------- #
@@ -111,11 +129,37 @@ def canonicalize(points_xyz: np.ndarray, axis: TubeAxis) -> np.ndarray:
 #  STEP (cadquery / OCP)
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+#  Pomoc: czy dwie osie (gp_Ax1) leza na tej samej prostej w przestrzeni
+#  [PATCH/FEATURE] - uzywane do znalezienia WEWNETRZNEJ powierzchni walcowej
+#  (grubosc sciany) bez pomylenia jej z otworami (te maja os PROSTOPADLA,
+#  nie rownolegla, do osi rury - bo sa wiercone/frezowane promieniowo).
+# --------------------------------------------------------------------------- #
+
+def _axes_coaxial(loc1: np.ndarray, dir1: np.ndarray,
+                   loc2: np.ndarray, dir2: np.ndarray,
+                   loc_tol_mm: float = 0.5, dir_tol: float = 1e-3) -> bool:
+    dir1 = dir1 / np.linalg.norm(dir1)
+    dir2 = dir2 / np.linalg.norm(dir2)
+    if abs(abs(float(np.dot(dir1, dir2))) - 1.0) > dir_tol:
+        return False
+    v = loc2 - loc1
+    perp = v - np.dot(v, dir1) * dir1
+    return float(np.linalg.norm(perp)) < loc_tol_mm
+
+
 def load_step_holes(path: str, tolerance_mm: float = 0.03,
                      outer_radius_hint_mm: Optional[float] = None,
-                     radius_match_tol_mm: float = 0.5) -> Tuple[List[RawHole], TubeAxis]:
+                     radius_match_tol_mm: float = 0.5
+                     ) -> Tuple[List[RawHole], TubeAxis, TubeGeometryInfo]:
     """
-    Zwraca (lista_otworow, os_rury) w oryginalnym ukladzie modelu.
+    Zwraca (lista_otworow, os_rury, geometria_rury) w oryginalnym ukladzie modelu.
+
+    `outer_radius_hint_mm=None` -> W PELNI AUTOMATYCZNE wykrycie: brana jest
+    najwieksza powierzchnia walcowa w calym modelu (typowo to zewnetrzna
+    powloka rury). Podaj hint tylko gdy model ma inna, nietypowa geometrie
+    (np. wieksza od rury tuleje montazowa), ktora bez ograniczenia promienia
+    zostalaby blednie wybrana jako "rura".
 
     Strategia (patrz README, sekcja "Jak dziala ekstrakcja z STEP" po
     szczegolowe uzasadnienie -- w skrocie: NIE polegamy na strukturze
@@ -137,7 +181,15 @@ def load_step_holes(path: str, tolerance_mm: float = 0.03,
        tolerance_mm) i wyciagnij jej wlasna triangulacje.
     4. Znajdz petle brzegowe, sklasyfikuj: petla obejmujaca ~caly obwod
        (360 st.) I majaca prawie zerowy zasieg wzdluz osi = obrys konca
-       rury (odrzucamy); kazda inna petla = otwor.
+       rury (odrzucamy, ale jej zasieg wzdluz osi X wykorzystujemy do
+       automatycznego wyznaczenia dlugosci rury - patrz TubeGeometryInfo);
+       kazda inna petla = otwor.
+    5. [PATCH/FEATURE] Szukamy dodatkowo powierzchni walcowej WSPOLOSIOWEJ
+       z zewnetrzna, o mniejszym promieniu -> to wewnetrzna sciana rury,
+       z ktorej wyliczamy grubosc scianki. Dlugosc rury liczona jest z
+       parametru V powierzchni walcowej (dla Geom_CylindricalSurface V jest
+       DOKLADNIE odlegloscia wzdluz osi od Location() -- ta sama konwencja,
+       co lokalna wspolrzedna X po canonicalize()), wiec nie wymaga siatki.
     """
     import cadquery as cq
     from OCP.TopAbs import TopAbs_FACE
@@ -167,6 +219,8 @@ def load_step_holes(path: str, tolerance_mm: float = 0.03,
         raise ValueError("Nie znaleziono zadnej powierzchni walcowej w modelu STEP - "
                           "sprawdz, czy model to rura (obiekt walcowy).")
 
+    all_cyl_faces = list(cyl_faces)  # PRZED filtrowaniem hintem - potrzebne do szukania sciany wewnetrznej
+
     if outer_radius_hint_mm is not None:
         cyl_faces = [f for f in cyl_faces
                      if abs(f[1] - outer_radius_hint_mm) < radius_match_tol_mm]
@@ -184,9 +238,41 @@ def load_step_holes(path: str, tolerance_mm: float = 0.03,
     ax1 = outer[0][2].Axis()
     loc = ax1.Location()
     d = ax1.Direction()
-    axis = TubeAxis(point_on_axis=np.array([loc.X(), loc.Y(), loc.Z()]),
-                     direction=np.array([d.X(), d.Y(), d.Z()]),
-                     radius_mm=outer_radius)
+    axis_loc = np.array([loc.X(), loc.Y(), loc.Z()])
+    axis_dir = np.array([d.X(), d.Y(), d.Z()])
+    axis = TubeAxis(point_on_axis=axis_loc, direction=axis_dir, radius_mm=outer_radius)
+
+    # --- [PATCH/FEATURE] dlugosc rury z parametru V (bez siatkowania) ---
+    length_mm = None
+    x_extent = None
+    try:
+        v_values = []
+        for face, _radius, _cyl in outer:
+            fsurf = BRepAdaptor_Surface(face, True)
+            v_values.append(fsurf.FirstVParameter())
+            v_values.append(fsurf.LastVParameter())
+        if v_values:
+            x_extent = (float(min(v_values)), float(max(v_values)))
+            length_mm = x_extent[1] - x_extent[0]
+    except Exception:
+        pass  # nieobowiazkowe wzbogacenie danych - brak dlugosci nie blokuje wczytania otworow
+
+    # --- [PATCH/FEATURE] wewnetrzna powierzchnia walcowa (grubosc sciany) ---
+    inner_radius_mm = None
+    inner_candidates = [
+        f for f in all_cyl_faces
+        if f[1] < outer_radius - 1e-6
+        and _axes_coaxial(axis_loc, axis_dir,
+                           np.array([f[2].Axis().Location().X(), f[2].Axis().Location().Y(),
+                                     f[2].Axis().Location().Z()]),
+                           np.array([f[2].Axis().Direction().X(), f[2].Axis().Direction().Y(),
+                                     f[2].Axis().Direction().Z()]))
+    ]
+    if inner_candidates:
+        inner_radius_mm = max(f[1] for f in inner_candidates)
+
+    tube_geometry = TubeGeometryInfo(outer_radius_mm=outer_radius, inner_radius_mm=inner_radius_mm,
+                                      length_mm=length_mm, x_extent=x_extent)
 
     holes: List[RawHole] = []
     hole_idx = 0
@@ -211,7 +297,7 @@ def load_step_holes(path: str, tolerance_mm: float = 0.03,
             "oraz TubeConfig.outer_diameter_mm (musi pasowac do promienia "
             "zewnetrznego w pliku STEP)."
         )
-    return holes, axis
+    return holes, axis, tube_geometry
 
 
 def _mesh_face_boundary_loops(face, tolerance_mm: float) -> List[np.ndarray]:
@@ -275,7 +361,8 @@ def _merge_duplicate_points(points: np.ndarray, tol: float = 1e-4):
 #  Mesh: 3MF / STL / OBJ (trimesh) - metoda przyblizona (krawedzie brzegowe)
 # --------------------------------------------------------------------------- #
 
-def load_mesh_holes(path: str, min_loop_points: int = 6) -> Tuple[List[RawHole], TubeAxis]:
+def load_mesh_holes(path: str, min_loop_points: int = 6
+                     ) -> Tuple[List[RawHole], TubeAxis, TubeGeometryInfo]:
     """
     UWAGA (patrz naglowek pliku): dziala tylko dla siatek "otwartych" w
     miejscu otworow (skorupa z dziurami), NIE dla pelnych/zamknietych brył.
@@ -303,6 +390,22 @@ def load_mesh_holes(path: str, min_loop_points: int = 6) -> Tuple[List[RawHole],
     loops = _chain_edges_into_loops(boundary_edges)
     axis = fit_cylinder_axis(mesh.vertices)
 
+    # [PATCH/FEATURE] dlugosc rury: siatka (po odrzuceniu watertight powyzej)
+    # to CALA powloka zewnetrzna rury, wiec jej wlasny zasieg wzdluz osi PO
+    # kanonizacji jest wiarygodnym oszacowaniem calkowitej dlugosci rury -
+    # w odroznieniu od otworow (ktore zwykle nie siegaja do samych koncow).
+    # Grubosci sciany NIE probujemy tu wykryc (pojedyncza siatka trojkatow
+    # nie ma jednoznacznego rozdzielenia na "wewnetrzna"/"zewnetrzna"
+    # powierzchnie bez dodatkowych zalozen) - zostaje wartosc reczna w UI.
+    try:
+        can_all = canonicalize(mesh.vertices, axis)
+        x_extent = (float(can_all[:, 0].min()), float(can_all[:, 0].max()))
+        length_mm = x_extent[1] - x_extent[0]
+    except Exception:
+        x_extent, length_mm = None, None
+    tube_geometry = TubeGeometryInfo(outer_radius_mm=axis.radius_mm, inner_radius_mm=None,
+                                      length_mm=length_mm, x_extent=x_extent)
+
     holes = []
     hole_idx = 0
     # petla o najwiekszym obwodzie zwykle to koncowka rury (jesli otwarta na
@@ -328,7 +431,7 @@ def load_mesh_holes(path: str, min_loop_points: int = 6) -> Tuple[List[RawHole],
         holes.append(RawHole(name=f"hole_{hole_idx}", points_xyz=pts,
                               source="mesh_boundary_loop"))
 
-    return holes, axis
+    return holes, axis, tube_geometry
 
 
 def _chain_edges_into_loops(edges: List[Tuple[int, int]]) -> List[List[int]]:
@@ -382,7 +485,7 @@ def _polyline_length(pts: np.ndarray) -> float:
 
 def holes_from_manual_defs(hole_defs, tube_outer_radius_mm: float, tolerance_mm: float = 0.03):
     """Zwraca liste RawHole juz w ukladzie KANONICZNYM (x wzdluz osi X, promien=outer)."""
-    import hole_shapes as hs
+    from . import hole_shapes as hs
 
     holes = []
     for hd in hole_defs:
@@ -408,6 +511,5 @@ def holes_from_manual_defs(hole_defs, tube_outer_radius_mm: float, tolerance_mm:
             y = tube_outer_radius_mm * math.cos(theta)
             z = tube_outer_radius_mm * math.sin(theta)
             pts3d.append([x, y, z])
-        holes.append(RawHole(name=hd.name, points_xyz=np.array(pts3d), source="manual",
-                              tabs_override=hd.tabs_override))
+        holes.append(RawHole(name=hd.name, points_xyz=np.array(pts3d), source="manual"))
     return holes

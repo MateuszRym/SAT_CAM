@@ -1,21 +1,22 @@
 {
+  "version": 1,
   "tube": {
     "outer_diameter_mm": 75.0,
-    "wall_thickness_mm": 2.0,
-    "length_mm": 300.0,
+    "wall_thickness_mm": 2.5,
+    "length_mm": 1000.0,
     "x_zero_at": "min",
     "x_offset_mm": 0.0
   },
   "tool": {
     "kind": "endmill",
-    "diameter_mm": 3.0,
+    "diameter_mm": 2.0,
     "flutes": 2,
-    "spindle_rpm": 12000.0,
+    "spindle_rpm": 18000.0,
     "spindle_cw": true,
     "feed_cut_mm_min": 400.0,
     "feed_plunge_mm_min": 80.0,
     "feed_rapid_mm_min": 1500.0,
-    "feed_drill_mm_min": 40.0,
+    "feed_drill_mm_min": 60.0,
     "max_rotary_speed_deg_min": 3000.0
   },
   "job": {
@@ -29,10 +30,19 @@
     "coolant": null,
     "program_name": "PIPE_HOLES",
     "drill_peck_mm": 1.0,
+    "drill_diameter_tolerance_mm": 0.05,
     "drill_full_retract": true,
-    "drill_retract_mm": 0.5,
-    "drill_diameter_tolerance_mm": 0.15
+    "drill_retract_mm": 1.0
   },
   "holes": [],
-  "source_model_path": null
+  "machine": {
+    "a_sign": 1,
+    "a_zero_offset_deg": 0.0,
+    "outer_radius_hint_mm": null,
+    "radius_match_tol_mm": 0.5,
+    "step_tolerance_override_mm": null,
+    "x_extent_source": "auto"
+  },
+  "source_mode": "step",
+  "source_model_path": "C:/Users/Mateusz/Downloads/Zielona_A14e(Zlorzenie_najlepsze).step"
 }
