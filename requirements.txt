@@ -1,0 +1,16 @@
+# Wymagane zawsze (silnik CAM + UI):
+numpy>=1.24
+pyclipper>=1.3
+matplotlib>=3.7
+
+# tkinter: czesc standardowej biblioteki Pythona, ale na Linuksie czesto
+# trzeba doinstalowac pakiet systemowy:
+#   Debian/Ubuntu:  sudo apt-get install python3-tk
+#   Fedora:         sudo dnf install python3-tkinter
+#   macOS/Windows:  wchodzi w sklad standardowego instalatora python.org
+
+# Opcjonalne - tylko jesli chcesz wczytywac modele z plikow STEP:
+# cadquery>=2.4
+
+# Opcjonalne - tylko jesli chcesz wczytywac modele z plikow 3MF/STL/OBJ:
+# trimesh>=4.0

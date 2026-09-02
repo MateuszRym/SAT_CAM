@@ -127,7 +127,7 @@ def theta_to_deg_continuous(theta_unwrapped_rad: np.ndarray, sign: int = 1,
 # --------------------------------------------------------------------------- #
 
 def offset_polygon_inward(xy: np.ndarray, offset_mm: float,
-                           arc_tolerance_mm: float = 0.02) -> List[np.ndarray]:
+                           arc_tolerance_mm: float = None) -> List[np.ndarray]:
     """
     Przesuwa zamkniety kontur (N,2) o `offset_mm` DO WEWNATRZ (w strone
     usuwanego materialu = wnetrza otworu). Zwraca liste petli (moze byc >1,
@@ -137,20 +137,20 @@ def offset_polygon_inward(xy: np.ndarray, offset_mm: float,
     Kontur WEJSCIOWY musi byc CCW (patrz hole_shapes.ensure_ccw) - przy
     CCW dodatni ClipperOffset z ujemnym argumentem daje offset do wnetrza.
 
-    `arc_tolerance_mm` ogranicza blad cieciwy, z jakim pyclipper aproksymuje
-    zaokraglone (JT_ROUND) naroza wielokatem -- BEZ jawnego ustawienia
-    pyclipper uzywa dosc zgrubnej wartosci domyslnej, co przy malych
-    promieniach (rzedu promienia narzedzia) daje zauwazalnie "kanciasty"
-    luk i psuje pozniejsze oszacowanie lokalnej krzywizny konturu
-    (geometry_core.find_tight_corners) fałszywymi ostrzezeniami nawet na
-    gladkim okragu.
+    `arc_tolerance_mm`: [PATCH - zgodnosc z wywolaniem w toolpath.py, ktore
+    przekazuje job.tolerance_mm] maksymalny blad cieciwy dla lukow JT_ROUND
+    generowanych na wypuklych naroznikach offsetu. Przekazywane wprost do
+    pyclipper.PyclipperOffset.ArcTolerance (te same jednostki co CLIPPER_SCALE,
+    wiec skalujemy tak samo jak wspolrzedne). Jesli None, uzywany jest
+    domyslny ArcTolerance z pyclipper.
     """
     assert offset_mm >= 0
     path = (xy[:-1] if np.allclose(xy[0], xy[-1]) else xy)  # bez powielonego punktu koncowego
     scaled = pyclipper.scale_to_clipper(path.tolist(), CLIPPER_SCALE)
 
     pco = pyclipper.PyclipperOffset()
-    pco.ArcTolerance = arc_tolerance_mm * CLIPPER_SCALE
+    if arc_tolerance_mm is not None:
+        pco.ArcTolerance = max(arc_tolerance_mm, 1e-4) * CLIPPER_SCALE
     # JT_ROUND: frez jest okragly, wiec zaokraglone naroza to fizycznie
     # poprawny ksztalt sladu narzedzia w naroznikach wypuklych "od zewnatrz"
     pco.AddPath(scaled, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)

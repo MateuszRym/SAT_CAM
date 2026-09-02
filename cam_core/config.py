@@ -78,16 +78,13 @@ class ToolConfig:
 
     # Posuwy
     feed_cut_mm_min: float = 400.0     # posuw konturowania (XZ, liniowy ekwiwalent)
-    feed_plunge_mm_min: float = 80.0   # posuw wgladu promieniowego (Z) przy KONTUROWANIU
+    feed_plunge_mm_min: float = 80.0   # posuw wgladu promieniowego (Z)
     feed_rapid_mm_min: float = 1500.0  # "rapid" realizowany jako G1 z duzym F
                                         # (patrz README: dlaczego nie G0 na A)
-
-    # Osobny, WOLNIEJSZY posuw dla trybu WIERCENIA (gdy narzedzie uzywane
-    # jest jak wiertlo - patrz toolpath.py, otwory o srednicy ~= srednicy
-    # narzedzia, gdzie kontur nie miesci sie do zoffsetowania). Wiercenie
-    # martwym srodkiem freza wymaga wolniejszego Z niz zwykly plunge przy
-    # konturowaniu, bo caly przekroj narzedzia pracuje naraz (nie tylko obwod).
-    feed_drill_mm_min: float = 40.0
+    # [PATCH] brakowalo w oryginalnym pliku, a jest uzywane w toolpath.py
+    # (_build_drill_operation, komunikat ostrzezenia) oraz gcode_writer.py
+    # (_write_drill) -- osobny, wolniejszy posuw dla cyklu peckingowego wiercenia.
+    feed_drill_mm_min: float = 60.0
 
     # Bezpieczenstwo obrotu -- patrz gcode_writer.audit_and_limit_feed()
     max_rotary_speed_deg_min: float = 3000.0
@@ -113,18 +110,13 @@ class JobConfig:
     coolant: Optional[str] = None      # None / "mist" / "flood" -> M7/M8 (opcjonalnie)
     program_name: str = "PIPE_HOLES"
 
-    # --- tryb WIERCENIA (patrz toolpath.py: automatyczne przelaczenie gdy
-    #     kontur nie miesci sie do zoffsetowania, a otwor jest kolowy) ---
-    drill_peck_mm: float = 1.0            # glebokosc pojedynczego "pecka"
-    drill_full_retract: bool = True       # True: pelny odwrot do safe_z miedzy peckami
-                                           # (bezpieczniejsze, wolniejsze - polecane przy
-                                           # braku odciagu/dmuchawy wiorow)
-    drill_retract_mm: float = 0.5         # uzywane tylko gdy drill_full_retract=False:
-                                           # czesciowy odwrot miedzy peckami
-    drill_diameter_tolerance_mm: float = 0.15  # o ile narzedzie MOZE byc wieksze niz
-                                           # zmierzona srednica otworu, a mimo to uznajemy
-                                           # ze "pasuje jako wiertlo" (naddatek na
-                                           # tolerancje pomiaru/tesselacji z modelu)
+    # [PATCH] brakowalo w oryginalnym pliku, a sa uzywane w toolpath.py
+    # (tryb DRILL, patrz modul docstring "AUTOMATYCZNE PRZELACZENIE W DRILL")
+    # oraz gcode_writer.py (_write_drill):
+    drill_peck_mm: float = 1.0                 # dosuw promieniowy na jedno "naklucie" pecku
+    drill_diameter_tolerance_mm: float = 0.05  # margines przy decyzji "czy zmiesci sie jako wiertlo"
+    drill_full_retract: bool = True            # True: pelny odwrot do safe_z po kazdym pecku
+    drill_retract_mm: float = 1.0              # gdy NIE full_retract: czesciowy odwrot o tyle mm
 
 
 # --------------------------------------------------------------------------- #
